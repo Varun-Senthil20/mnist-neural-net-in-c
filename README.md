@@ -17,9 +17,9 @@ Downloads the MNIST dataset and sets up the data folder structure.
 make run
 ```
 Compiles both training and inference code, generating two executables:
+Note: you will have to install the openblas packages before you can compile the training code.
 - `train.o` - Training executable
 - `test.o` - Testing/Inference executable
-Note: you will have to install the openblas packages before you can compile the training code.
 ---
 
 ## 🏃‍♂️ Usage
