@@ -13,12 +13,17 @@ make data_download
 Downloads the MNIST dataset and sets up the data folder structure.
 
 ### 🔨 Build & Compile
+**Prerequisites:**
+OpenBLAS library is required. Install it using:
+```bash
+sudo apt-get install libopenblas-dev
+```
+*Note: The exact command may differ for different Linux distributions.*
+
 ```bash
 make run
 ```
 Compiles both training and inference code, generating two executables:
-
-Note: you will have to install the openblas packages before you can compile the training code.
 - `train.o` - Training executable
 - `test.o` - Testing/Inference executable
 ---
