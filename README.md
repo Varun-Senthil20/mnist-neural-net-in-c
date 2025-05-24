@@ -15,11 +15,11 @@ Downloads the MNIST dataset and sets up the data folder structure.
 ### 🔨 Build & Compile
 **Prerequisites:**
 OpenBLAS library is required. Install it using:
+*Note: The exact command may differ for different Linux distributions.*
 ```bash
 sudo apt-get install libopenblas-dev
 ```
-*Note: The exact command may differ for different Linux distributions.*
-
+compiling:
 ```bash
 make run
 ```
