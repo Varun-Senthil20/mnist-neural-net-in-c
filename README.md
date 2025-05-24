@@ -19,7 +19,7 @@ OpenBLAS library is required. Install it using:
 ```bash
 sudo apt-get install libopenblas-dev
 ```
-compiling:
+Compiling:
 ```bash
 make run
 ```
