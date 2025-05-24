@@ -19,7 +19,7 @@ make run
 Compiles both training and inference code, generating two executables:
 - `train.o` - Training executable
 - `test.o` - Testing/Inference executable
-
+Note: you will have to install the openblas packages before you can compile the training code.
 ---
 
 ## 🏃‍♂️ Usage
@@ -28,7 +28,6 @@ Compiles both training and inference code, generating two executables:
 ```bash
 OPENBLAS_NUM_THREADS=4 OMP_NUM_THREADS=2 ./train.o -n 2
 ```
-
 **Parameters:**
 - `OPENBLAS_NUM_THREADS=4` - Number of threads for BLAS operations
 - `OMP_NUM_THREADS=2` - Number of OpenMP threads
