@@ -234,8 +234,8 @@ void load_weights(NN *model, char* file_name)
     }
     fread(&n, sizeof(int),1, file);
     printf("This model has %d layers\n",n);
-    alloc_runstate(model,n);
     model->n=n;
+    alloc_runstate(model,n);
     for(int i=0;i<model->n+1;i++)//takes care of all layers except the output layer;
     {
         fread(model->layers[i].weights, sizeof(float), model->layers[i].size * model->layers[i+1].size, file);
