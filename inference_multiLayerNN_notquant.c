@@ -8,6 +8,9 @@
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
+#ifdef USE_MPI
+#include <mpi.h>
+#endif
 
 // Configuration
 #define INPUT_SIZE 784
@@ -305,8 +308,54 @@ void load_weights(NN *model, const char *file_name) {
     LOG("Loaded weights from %s", file_name);
 }
 
-// Forward function with three implementations
-#if defined(USE_OPENMP)
+// Forward function with four implementations
+#if defined(USE_MPI)
+void forward(NN *model, int layer_number) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    int d = model->layers[layer_number + 1].size;
+    int n = model->layers[layer_number].size;
+    fixed_t *input = model->layers[layer_number].activations;
+    fixed_t *output = model->layers[layer_number + 1].activations;
+    fixed_t *weights = model->layers[layer_number].weights;
+    fixed_t *biases = model->layers[layer_number].biases;
+
+    // Calculate work distribution
+    int neurons_per_proc = d / size;
+    int remainder = d % size;
+    int start_neuron = rank * neurons_per_proc + (rank < remainder ? rank : remainder);
+    int end_neuron = start_neuron + neurons_per_proc + (rank < remainder ? 1 : 0);
+    
+    // Compute assigned neurons
+    for (int i = start_neuron; i < end_neuron; i++) {
+        int64_t sum = (int64_t)biases[i] * FIXED_SCALE;
+        for (int j = 0; j < n; j++) {
+            sum += (int64_t)weights[i * n + j] * input[j];
+        }
+        output[i] = (fixed_t)(sum / FIXED_SCALE);
+        if (output[i] > FLOAT_TO_FIXED(100.0f)) output[i] = FLOAT_TO_FIXED(100.0f);
+        if (output[i] < FLOAT_TO_FIXED(-100.0f)) output[i] = FLOAT_TO_FIXED(-100.0f);
+    }
+    
+    // Gather results from all processes
+    int *recvcounts = malloc(size * sizeof(int));
+    int *displs = malloc(size * sizeof(int));
+    
+    for (int i = 0; i < size; i++) {
+        int proc_neurons = neurons_per_proc + (i < remainder ? 1 : 0);
+        recvcounts[i] = proc_neurons;
+        displs[i] = i * neurons_per_proc + (i < remainder ? i : remainder);
+    }
+    
+    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
+                   output, recvcounts, displs, MPI_INT32_T, MPI_COMM_WORLD);
+    
+    free(recvcounts);
+    free(displs);
+}
+#elif defined(USE_OPENMP)
 void forward(NN *model, int layer_number) {
     int d = model->layers[layer_number + 1].size;
     int n = model->layers[layer_number].size;
@@ -426,15 +475,34 @@ void test(NN *model, int correct_label) {
     }
 }
 
-int main() {
+int main(int argc, char *argv[]) {
+#ifdef USE_MPI
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+#endif
+
     char *file_name = "saved_model.NN";
     NN model_1 = {0};
     data dataset_1 = {0};
     malloc_data(&dataset_1);
-    LOG("Loading test data...");
-    read_mnist_images("./data/t10k-images.idx3-ubyte", dataset_1.test_images, NUM_TEST_IMAGES);
-    read_mnist_labels("./data/t10k-labels.idx1-ubyte", dataset_1.test_labels, NUM_TEST_IMAGES);
-    LOG("Loaded test data");
+    
+#ifdef USE_MPI
+    if (rank == 0) {
+#endif
+        LOG("Loading test data...");
+        read_mnist_images("./data/t10k-images.idx3-ubyte", dataset_1.test_images, NUM_TEST_IMAGES);
+        read_mnist_labels("./data/t10k-labels.idx1-ubyte", dataset_1.test_labels, NUM_TEST_IMAGES);
+        LOG("Loaded test data");
+#ifdef USE_MPI
+    }
+    
+    // Broadcast test data to all processes
+    MPI_Bcast(dataset_1.test_images, NUM_TEST_IMAGES * INPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(dataset_1.test_labels, NUM_TEST_IMAGES, MPI_INT, 0, MPI_COMM_WORLD);
+#endif
+    
     load_weights(&model_1, file_name);
 
     struct timespec start, end;
@@ -444,7 +512,11 @@ int main() {
     for (int i = 0; i < NUM_TEST_IMAGES; i++) {
         prep_rs(&model_1, &dataset_1, i);
         test(&model_1, dataset_1.test_labels[i]);
+#ifdef USE_MPI
+        if (rank == 0 && (i + 1) % 1000 == 0) {
+#else
         if ((i + 1) % 1000 == 0) {
+#endif
             LOG("%d images processed... accuracy: %f", i + 1, 
                 (float)model_1.num_correct_predictions / (i + 1));
         }
@@ -453,9 +525,17 @@ int main() {
     clock_gettime(CLOCK_MONOTONIC, &end);
     long ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
 
-    float accuracy = (float)model_1.num_correct_predictions / NUM_TEST_IMAGES;
-    printf("Test Accuracy: %.4f\n", accuracy);
-    printf("Inference Time: %ld ms\n", ms);
+#ifdef USE_MPI
+    if (rank == 0) {
+#endif
+        float accuracy = (float)model_1.num_correct_predictions / NUM_TEST_IMAGES;
+        printf("Test Accuracy: %.4f\n", accuracy);
+        printf("Inference Time: %ld ms\n", ms);
+#ifdef USE_MPI
+    }
+    
+    MPI_Finalize();
+#endif
 
     // free_data(&dataset_1);
     // free_memory_pool((struct MemoryPool *)model_1.layers[0].activations); // Pool allocated in load_weights
