@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -5,6 +7,9 @@
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sched.h>
 #ifdef USE_OPENMP
 #include <omp.h>
 #endif
@@ -42,6 +47,105 @@ typedef float fixed_t;
 // Logging
 #define LOG(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
 #define ERR(fmt, ...) fprintf(stderr, "[ERROR] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+
+// MPI Debug Functions
+#ifdef USE_MPI
+
+void print_mpi_debug_info() {
+    int rank, size;
+    char processor_name[MPI_MAX_PROCESSOR_NAME];
+    int name_len;
+    
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Get_processor_name(processor_name, &name_len);
+    
+    pid_t pid = getpid();
+    pid_t ppid = getppid();
+    
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    
+    int core = sched_getcpu();  // <-- Get the currently executing CPU core
+
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        printf("=== MPI DEBUG INFO ===\n");
+        printf("[RANK %d] Hostname: %s, PID: %d, PPID: %d\n", rank, processor_name, pid, ppid);
+        printf("[RANK %d] Affinity mask: ", rank);
+        for (int i = 0; i < CPU_SETSIZE; i++) {
+            if (CPU_ISSET(i, &mask)) {
+                printf("%d ", i);
+            }
+        }
+        printf("\n");
+        printf("[RANK %d] Currently running on core: %d\n", rank, core);
+        printf("\n");
+    } else {
+        printf("[RANK %d] Failed to get CPU affinity info.\n", rank);
+    }
+
+    fflush(stdout);
+}
+
+void verify_distributed_memory() {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    // Allocate test memory and get its address
+    size_t test_size = 1024 * 1024; // 1MB
+    void *test_ptr = malloc(test_size);
+    
+    if (test_ptr == NULL) {
+        printf("[RANK %d] Memory allocation failed\n", rank);
+        return;
+    }
+    
+    // Print memory address for each process
+    printf("[RANK %d] Memory address: %p, Size: %zu bytes\n", 
+           rank, test_ptr, test_size);
+    
+    // Write unique data to each process's memory
+    int *data = (int*)test_ptr;
+    for (int i = 0; i < 10; i++) {
+        data[i] = rank * 1000 + i; // Unique pattern per rank
+    }
+    
+    // Print first few values to show they're different per process
+    printf("[RANK %d] Memory content: ", rank);
+    for (int i = 0; i < 5; i++) {
+        printf("%d ", data[i]);
+    }
+    printf("\n");
+    
+    free(test_ptr);
+    fflush(stdout);
+}
+
+void test_memory_isolation() {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    // Each process creates a variable with the same name but different values
+    static int shared_variable = 0;
+    shared_variable = rank * 100;
+    
+    printf("[RANK %d] shared_variable = %d (address: %p)\n", 
+           rank, shared_variable, (void*)&shared_variable);
+    
+    // Barrier to ensure all processes print before continuing
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        printf("\n=== MEMORY ISOLATION TEST ===\n");
+        printf("Notice: Same variable name, different addresses and values!\n");
+        printf("This proves each process has its own memory space.\n\n");
+    }
+    
+    fflush(stdout);
+}
+#endif
 
 // Data structure
 typedef struct {
@@ -481,6 +585,25 @@ int main(int argc, char *argv[]) {
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
+    // Print debug information
+    print_mpi_debug_info();
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        printf("\n=== DISTRIBUTED MEMORY VERIFICATION ===\n");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    verify_distributed_memory();
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    test_memory_isolation();
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        printf("\n=== STARTING NEURAL NETWORK INFERENCE ===\n");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
 #endif
 
     char *file_name = "saved_model.NN";
