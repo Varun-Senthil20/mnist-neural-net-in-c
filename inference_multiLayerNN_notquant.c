@@ -1,300 +1,666 @@
+#define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <ctype.h>
 #include <stdint.h>
-#include <time.h>
-#include <math.h>
 #include <string.h>
-const int hidden_size=256;
-const int input_size=784;
-const int output_size=10;
-const int num_train_images=60000;//might need to change these num_..._images things when we switch datasets.
-const int num_test_images=10000;
-const int num_epochs=10;
+#include <math.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sched.h>
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
+#ifdef USE_MPI
+#include <mpi.h>
+#endif
 
-typedef struct{
-float *training_images;//num_train_images*input_size
-int *training_labels;
-float *test_images;
-int *test_labels;
-}data;
-typedef struct{
-int size;
-float *activations;
-float *weights;
-float *biases;
+// Configuration
+#define INPUT_SIZE 784
+#define OUTPUT_SIZE 10
+#define HIDDEN_SIZE 256
+#define NUM_TEST_IMAGES 10000
+#define MAX_LAYERS 8
+#define MAX_NEURONS 1024
+#define FIXED_POINT 1
+#define ALIGNMENT 64
+#define FIXED_SCALE (1LL << 20)
+#define NUM_THREADS 4
+
+// Fixed-point arithmetic
+#if FIXED_POINT
+typedef int32_t fixed_t;
+#define FLOAT_TO_FIXED(x) ((fixed_t)((x) * FIXED_SCALE))
+#define FIXED_TO_FLOAT(x) ((float)(x) / FIXED_SCALE)
+#define FIXED_MUL(x, y) (((int64_t)(x) * (y)) / FIXED_SCALE)
+#define FIXED_DIV(x, y) (((int64_t)(x) * FIXED_SCALE) / (y))
+#else
+typedef float fixed_t;
+#define FLOAT_TO_FIXED(x) (x)
+#define FIXED_TO_FLOAT(x) (x)
+#define FIXED_MUL(x, y) ((x) * (y))
+#define FIXED_DIV(x, y) ((x) / (y))
+#endif
+
+// Logging
+#define LOG(fmt, ...) fprintf(stderr, "[INFO] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#define ERR(fmt, ...) fprintf(stderr, "[ERROR] %s:%d: " fmt "\n", __FILE__, __LINE__, ##__VA_ARGS__)
+
+// MPI Debug Functions
+#ifdef USE_MPI
+
+void print_mpi_debug_info() {
+    int rank, size;
+    char processor_name[MPI_MAX_PROCESSOR_NAME];
+    int name_len;
+    
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    MPI_Get_processor_name(processor_name, &name_len);
+    
+    pid_t pid = getpid();
+    pid_t ppid = getppid();
+    
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    
+    int core = sched_getcpu();  // <-- Get the currently executing CPU core
+
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        printf("=== MPI DEBUG INFO ===\n");
+        printf("[RANK %d] Hostname: %s, PID: %d, PPID: %d\n", rank, processor_name, pid, ppid);
+        printf("[RANK %d] Affinity mask: ", rank);
+        for (int i = 0; i < CPU_SETSIZE; i++) {
+            if (CPU_ISSET(i, &mask)) {
+                printf("%d ", i);
+            }
+        }
+        printf("\n");
+        printf("[RANK %d] Currently running on core: %d\n", rank, core);
+        printf("\n");
+    } else {
+        printf("[RANK %d] Failed to get CPU affinity info.\n", rank);
+    }
+
+    fflush(stdout);
+}
+
+void verify_distributed_memory() {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    // Allocate test memory and get its address
+    size_t test_size = 1024 * 1024; // 1MB
+    void *test_ptr = malloc(test_size);
+    
+    if (test_ptr == NULL) {
+        printf("[RANK %d] Memory allocation failed\n", rank);
+        return;
+    }
+    
+    // Print memory address for each process
+    printf("[RANK %d] Memory address: %p, Size: %zu bytes\n", 
+           rank, test_ptr, test_size);
+    
+    // Write unique data to each process's memory
+    int *data = (int*)test_ptr;
+    for (int i = 0; i < 10; i++) {
+        data[i] = rank * 1000 + i; // Unique pattern per rank
+    }
+    
+    // Print first few values to show they're different per process
+    printf("[RANK %d] Memory content: ", rank);
+    for (int i = 0; i < 5; i++) {
+        printf("%d ", data[i]);
+    }
+    printf("\n");
+    
+    free(test_ptr);
+    fflush(stdout);
+}
+
+void test_memory_isolation() {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    // Each process creates a variable with the same name but different values
+    static int shared_variable = 0;
+    shared_variable = rank * 100;
+    
+    printf("[RANK %d] shared_variable = %d (address: %p)\n", 
+           rank, shared_variable, (void*)&shared_variable);
+    
+    // Barrier to ensure all processes print before continuing
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        printf("\n=== MEMORY ISOLATION TEST ===\n");
+        printf("Notice: Same variable name, different addresses and values!\n");
+        printf("This proves each process has its own memory space.\n\n");
+    }
+    
+    fflush(stdout);
+}
+#endif
+
+// Data structure
+typedef struct {
+    float *training_images;
+    int *training_labels;
+    float *test_images;
+    int *test_labels;
+} data;
+
+// Layer structure
+typedef struct {
+    int size;
+    fixed_t *activations;
+    fixed_t *weights;
+    fixed_t *biases;
 } layer;
-typedef struct{
-    int n;
+
+// Neural network structure
+typedef struct {
+    int n; // Number of hidden layers
     layer *layers;
     int num_correct_predictions;
-}NN;
-int reverse_int(int i) {
-    unsigned char c1, c2, c3, c4;
-    c1 = i & 255;
-    c2 = (i >> 8) & 255;
-    c3 = (i >> 16) & 255;
-    c4 = (i >> 24) & 255;
-    return ((int)c1 << 24) + ((int)c2 << 16) + ((int)c3 << 8) + c4;
-}
-// Read MNIST images
-void read_mnist_images(const char *filename, float*images, int num_images) {
-    FILE *fp = fopen(filename, "rb");
-    if (!fp) {
-        printf("Could not open file %s\n", filename);
+} NN;
+
+// Memory pool
+struct MemoryPool {
+    uint8_t *buffer;
+    size_t size;
+    size_t offset;
+};
+
+struct MemoryPool *create_memory_pool(size_t size) {
+    struct MemoryPool *pool = malloc(sizeof(struct MemoryPool));
+    if (!pool) {
+        ERR("Memory pool allocation failed");
         exit(1);
     }
-    int magic_number = 0;
-    int number_of_images = 0;
-    int rows = 0;
-    int cols = 0;
+    pool->buffer = aligned_alloc(ALIGNMENT, size);
+    if (!pool->buffer) {
+        ERR("Memory pool buffer allocation failed");
+        free(pool);
+        exit(1);
+    }
+    pool->size = size;
+    pool->offset = 0;
+    return pool;
+}
 
-    fread(&magic_number, sizeof(int), 1, fp);
+void *pool_alloc(struct MemoryPool *pool, size_t size) {
+    size_t aligned_size = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    if (pool->offset + aligned_size > pool->size) {
+        ERR("Memory pool out of space: %zu requested", aligned_size);
+        exit(1);
+    }
+    void *ptr = pool->buffer + pool->offset;
+    pool->offset += aligned_size;
+    return ptr;
+}
+
+void free_memory_pool(struct MemoryPool *pool) {
+    free(pool->buffer);
+    free(pool);
+}
+
+// Utility functions
+int reverse_int(int i) {
+    unsigned char c1 = i & 255;
+    unsigned char c2 = (i >> 8) & 255;
+    unsigned char c3 = (i >> 16) & 255;
+    unsigned char c4 = (i >> 24) & 255;
+    return ((int)c1 << 24) + ((int)c2 << 16) + ((int)c3 << 8) + c4;
+}
+
+void read_mnist_images(const char *filename, float *images, int num_images) {
+    FILE *fp = fopen(filename, "rb");
+    if (!fp) {
+        ERR("Could not open file %s", filename);
+        exit(1);
+    }
+    int magic_number, number_of_images, rows, cols;
+    if (fread(&magic_number, sizeof(int), 1, fp) != 1) {
+        ERR("Failed to read magic number");
+        fclose(fp);
+        exit(1);
+    }
     magic_number = reverse_int(magic_number);
-
-    fread(&number_of_images, sizeof(int), 1, fp);
+    if (fread(&number_of_images, sizeof(int), 1, fp) != 1) {
+        ERR("Failed to read number of images");
+        fclose(fp);
+        exit(1);
+    }
     number_of_images = reverse_int(number_of_images);
-
-    fread(&rows, sizeof(int), 1, fp);
+    if (fread(&rows, sizeof(int), 1, fp) != 1 || fread(&cols, sizeof(int), 1, fp) != 1) {
+        ERR("Failed to read dimensions");
+        fclose(fp);
+        exit(1);
+    }
     rows = reverse_int(rows);
-
-    fread(&cols, sizeof(int), 1, fp);
     cols = reverse_int(cols);
-
     for (int i = 0; i < num_images; ++i) {
         for (int r = 0; r < rows * cols; ++r) {
-            unsigned char pixel = 0;
-            fread(&pixel, sizeof(unsigned char), 1, fp);
-            images[i*input_size+r] = (float)(pixel / 255.0); // Normalize pixel values
+            unsigned char pixel;
+            if (fread(&pixel, sizeof(unsigned char), 1, fp) != 1) {
+                ERR("Failed to read pixel at image %d, pos %d", i, r);
+                fclose(fp);
+                exit(1);
+            }
+            images[i * INPUT_SIZE + r] = pixel / 255.0f;
         }
     }
     fclose(fp);
 }
 
-// Read MNIST labels
 void read_mnist_labels(const char *filename, int *labels, int num_labels) {
     FILE *fp = fopen(filename, "rb");
     if (!fp) {
-        printf("Could not open file %s\n", filename);
+        ERR("Could not open file %s", filename);
         exit(1);
     }
-    int magic_number = 0;
-    int number_of_labels = 0;
-
-    fread(&magic_number, sizeof(int), 1, fp);
+    int magic_number, number_of_labels;
+    if (fread(&magic_number, sizeof(int), 1, fp) != 1 || fread(&number_of_labels, sizeof(int), 1, fp) != 1) {
+        ERR("Failed to read label headers");
+        fclose(fp);
+        exit(1);
+    }
     magic_number = reverse_int(magic_number);
-
-    fread(&number_of_labels, sizeof(int), 1, fp);
     number_of_labels = reverse_int(number_of_labels);
-
     for (int i = 0; i < num_labels; ++i) {
-        unsigned char label = 0;
-        fread(&label, sizeof(unsigned char), 1, fp);
+        unsigned char label;
+        if (fread(&label, sizeof(unsigned char), 1, fp) != 1) {
+            ERR("Failed to read label %d", i);
+            fclose(fp);
+            exit(1);
+        }
         labels[i] = (int)label;
     }
     fclose(fp);
 }
-void set_sizes(NN *rs)
-{
-    rs->layers[0].size=input_size;
-    for(int i=0;i<rs->n;i++)
-    {
-        rs->layers[i+1].size=256;//can get each layer size as an input here or make a config file format which i can read here, future work....
-    }
-    rs->layers[rs->n+1].size=output_size;
-}
-void alloc_runstate(NN *rs,int n)
-{
-    rs->layers=(layer*)malloc((rs->n+2)*sizeof(layer));
-    set_sizes(rs);
-    for(int i=0;i<rs->n+1;i++)//takes care of all layers except the output layer;
-    {
-        rs->layers[i].activations=(float*)calloc(rs->layers[i].size,sizeof(float));
-        rs->layers[i].biases=(float*)calloc(rs->layers[i+1].size,sizeof(float));
-        rs->layers[i].weights=(float*)calloc(rs->layers[i+1].size*rs->layers[i].size,sizeof(float));
-    }
-    //taking care of the output layer
-    rs->layers[rs->n+1].activations=(float*)calloc(output_size,sizeof(float));
-    rs->layers[rs->n+1].biases=NULL;
-    rs->layers[rs->n+1].weights=NULL;
-}
-void free_runstate(NN *rs)
-{
-    for(int i=0;i<rs->n+1;i++)//takes care of all layers except the output layer;
-    {
-        free(rs->layers[i].activations);
-        free(rs->layers[i].biases);
-        free(rs->layers[i].weights);
+
+void malloc_data(data *dataset) {
+    dataset->test_images = malloc(NUM_TEST_IMAGES * INPUT_SIZE * sizeof(float));
+    dataset->test_labels = malloc(NUM_TEST_IMAGES * sizeof(int));
+    dataset->training_images = malloc(NUM_TEST_IMAGES * INPUT_SIZE * sizeof(float)); // Minimal allocation
+    dataset->training_labels = malloc(NUM_TEST_IMAGES * sizeof(int));
+    if (!dataset->test_images || !dataset->test_labels || !dataset->training_images || !dataset->training_labels) {
+        ERR("Data allocation failed");
+        exit(1);
     }
 }
-void free_data(data *dataset)
-{
+
+void free_data(data *dataset) {
     free(dataset->test_images);
     free(dataset->test_labels);
     free(dataset->training_images);
     free(dataset->training_labels);
 }
-void malloc_data(data* dataset)
-{
-    dataset->test_images=(float*)malloc(num_test_images*input_size*sizeof(float));
-    dataset->test_labels=(int*)malloc(num_test_images*sizeof(int));
-    dataset->training_images=(float*)malloc(num_train_images*input_size*sizeof(float));
-    dataset->training_labels=(int*)malloc(num_train_images*sizeof(int));
-}
-void prep_rs(NN *rs, data *dataset,int image_number)
-{
-    int previous_images=image_number*input_size;
-    for(int i=0;i<input_size;i++)
-    {
-        rs->layers[0].activations[i]=dataset->test_images[previous_images+i];
-    }
 
-}
-void sigmoid(float *x, int n)
-{
-    for(int i=0;i<n;i++)
-    {
-        x[i]=1.0 / (1.0 + exp(-x[i]));
+// Activation functions
+void relu(fixed_t *x, int n) {
+    for (int i = 0; i < n; i++) {
+        x[i] = x[i] > 0 ? x[i] : 0;
     }
 }
-void relu(float *x, int n)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        if(x[i]<0){
-            x[i]=0;
-        }
-    }
 
-}
-void softmax(float *x, int size) {
-    // softmax as defined here: https://en.wikipedia.org/wiki/Softmax_function
-
-    // Find the maximum value across all input values
-    float max = x[0];
+void softmax(fixed_t *x, int size, fixed_t *output) {
+    int64_t max = x[0];
     for (int i = 1; i < size; i++) {
         if (x[i] > max) max = x[i];
     }
-
-    // Compute the exponentials of the input values
-    float sum = 0.0;
+    int64_t sum = 0;
     for (int i = 0; i < size; i++) {
-        x[i] = exp(x[i] - max);
-        sum += x[i];
+        float val = FIXED_TO_FLOAT(x[i] - max);
+        if (val < -20.0f) val = -20.0f;
+        if (val > 20.0f) val = 20.0f;
+        output[i] = FLOAT_TO_FIXED(expf(val));
+        sum += output[i];
     }
-
-    // Normalize the output values
+    if (sum == 0) sum = 1;
     for (int i = 0; i < size; i++) {
-        x[i] /= sum;
+        output[i] = FIXED_DIV(output[i], sum);
     }
 }
-int max_index(float *out, int size) {
+
+int max_index(fixed_t *out, int size) {
     int max_i = 0;
     for (int i = 1; i < size; i++) {
-        if (out[i] > out[max_i]) {
-            max_i = i;
-        }
+        if (out[i] > out[max_i]) max_i = i;
     }
     return max_i;
 }
-void forward(NN *model ,int layer_number) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-    //#pragma omp parallel for private(i)
-    int d=model->layers[layer_number+1].size;
-    int n=model->layers[layer_number].size;
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += model->layers[layer_number].weights[i * n + j] * model->layers[layer_number].activations[j];
-        }
-        model->layers[layer_number+1].activations[i] = val+model->layers[layer_number].biases[i];
+
+// Network setup
+void set_sizes(NN *rs) {
+    rs->layers[0].size = INPUT_SIZE;
+    for (int i = 0; i < rs->n; i++) {
+        rs->layers[i + 1].size = HIDDEN_SIZE;
     }
+    rs->layers[rs->n + 1].size = OUTPUT_SIZE;
 }
-void matmul(float* xout, float* x, float* w, float*b ,int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // by far the most amount of time is spent inside this little function
-    int i;
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val+b[i];
+
+void alloc_runstate(struct MemoryPool *pool, NN *rs, int n) {
+    rs->n = n;
+    rs->layers = pool_alloc(pool, (n + 2) * sizeof(layer));
+    set_sizes(rs);
+    for (int i = 0; i < n + 1; i++) {
+        rs->layers[i].activations = pool_alloc(pool, rs->layers[i].size * sizeof(fixed_t));
+        rs->layers[i].weights = pool_alloc(pool, rs->layers[i + 1].size * rs->layers[i].size * sizeof(fixed_t));
+        rs->layers[i].biases = pool_alloc(pool, rs->layers[i + 1].size * sizeof(fixed_t));
     }
+    rs->layers[n + 1].activations = pool_alloc(pool, OUTPUT_SIZE * sizeof(fixed_t));
+    rs->layers[n + 1].weights = NULL;
+    rs->layers[n + 1].biases = NULL;
 }
-void load_weights(NN *model, char* file_name)
-{
-    FILE* file = fopen(file_name, "rb");
-    int n;
-    if (file == NULL) {
-        printf("Error opening file\n");
+
+void load_weights(NN *model, const char *file_name) {
+    FILE *file = fopen(file_name, "rb");
+    if (!file) {
+        ERR("Error opening file %s", file_name);
         exit(1);
     }
-    fread(&n, sizeof(int),1, file);
-    printf("This model has %d layers\n",n);
-    model->n=n;
-    alloc_runstate(model,n);
-    for(int i=0;i<model->n+1;i++)//takes care of all layers except the output layer;
-    {
-        fread(model->layers[i].weights, sizeof(float), model->layers[i].size * model->layers[i+1].size, file);
-        fread(model->layers[i].biases, sizeof(float), model->layers[i+1].size, file);
+    int n;
+    if (fread(&n, sizeof(int), 1, file) != 1) {
+        ERR("Failed to read number of hidden layers");
+        fclose(file);
+        exit(1);
+    }
+    struct MemoryPool *pool = create_memory_pool((n + 2) * MAX_NEURONS * (MAX_NEURONS + 1) * sizeof(fixed_t));
+    alloc_runstate(pool, model, n);
+    for (int i = 0; i < model->n + 1; i++) {
+        float *temp_weights = malloc(model->layers[i].size * model->layers[i + 1].size * sizeof(float));
+        float *temp_biases = malloc(model->layers[i + 1].size * sizeof(float));
+        if (!temp_weights || !temp_biases) {
+            ERR("Temporary buffer allocation failed");
+            free(temp_weights);
+            free(temp_biases);
+            fclose(file);
+            exit(1);
+        }
+        size_t w_size = model->layers[i].size * model->layers[i + 1].size;
+        if (fread(temp_weights, sizeof(float), w_size, file) != w_size) {
+            ERR("Error reading weights for layer %d", i);
+            free(temp_weights);
+            free(temp_biases);
+            fclose(file);
+            exit(1);
+        }
+        if (fread(temp_biases, sizeof(float), model->layers[i + 1].size, file) != model->layers[i + 1].size) {
+            ERR("Error reading biases for layer %d", i);
+            free(temp_weights);
+            free(temp_biases);
+            fclose(file);
+            exit(1);
+        }
+        for (size_t j = 0; j < w_size; j++) {
+            model->layers[i].weights[j] = FLOAT_TO_FIXED(temp_weights[j]);
+        }
+        for (size_t j = 0; j < model->layers[i + 1].size; j++) {
+            model->layers[i].biases[j] = FLOAT_TO_FIXED(temp_biases[j]);
+        }
+        free(temp_weights);
+        free(temp_biases);
     }
     fclose(file);
+    LOG("Loaded weights from %s", file_name);
 }
-void test(NN *model, int correct_label)
-{
-    float learning_rate = 0.01;
-    int i,j;
-    int out_layer_number=model->n+1;
-    // Feedforward
-    for(i=0;i<model->n;i++)
-    {
-        forward(model,i);
-        relu(model->layers[i+1].activations,model->layers[i+1].size);
+
+// Forward function with four implementations
+#if defined(USE_MPI)
+void forward(NN *model, int layer_number) {
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    
+    int d = model->layers[layer_number + 1].size;
+    int n = model->layers[layer_number].size;
+    fixed_t *input = model->layers[layer_number].activations;
+    fixed_t *output = model->layers[layer_number + 1].activations;
+    fixed_t *weights = model->layers[layer_number].weights;
+    fixed_t *biases = model->layers[layer_number].biases;
+
+    // Calculate work distribution
+    int neurons_per_proc = d / size;
+    int remainder = d % size;
+    int start_neuron = rank * neurons_per_proc + (rank < remainder ? rank : remainder);
+    int end_neuron = start_neuron + neurons_per_proc + (rank < remainder ? 1 : 0);
+    
+    // Compute assigned neurons
+    for (int i = start_neuron; i < end_neuron; i++) {
+        int64_t sum = (int64_t)biases[i] * FIXED_SCALE;
+        for (int j = 0; j < n; j++) {
+            sum += (int64_t)weights[i * n + j] * input[j];
+        }
+        output[i] = (fixed_t)(sum / FIXED_SCALE);
+        if (output[i] > FLOAT_TO_FIXED(100.0f)) output[i] = FLOAT_TO_FIXED(100.0f);
+        if (output[i] < FLOAT_TO_FIXED(-100.0f)) output[i] = FLOAT_TO_FIXED(-100.0f);
     }
-    forward(model,i);
-    //sigmoid(rs->out,output_size);
-    softmax(model->layers[out_layer_number].activations,output_size);
+    
+    // Gather results from all processes
+    int *recvcounts = malloc(size * sizeof(int));
+    int *displs = malloc(size * sizeof(int));
+    
+    for (int i = 0; i < size; i++) {
+        int proc_neurons = neurons_per_proc + (i < remainder ? 1 : 0);
+        recvcounts[i] = proc_neurons;
+        displs[i] = i * neurons_per_proc + (i < remainder ? i : remainder);
+    }
+    
+    MPI_Allgatherv(MPI_IN_PLACE, 0, MPI_DATATYPE_NULL, 
+                   output, recvcounts, displs, MPI_INT32_T, MPI_COMM_WORLD);
+    
+    free(recvcounts);
+    free(displs);
+}
+#elif defined(USE_OPENMP)
+void forward(NN *model, int layer_number) {
+    int d = model->layers[layer_number + 1].size;
+    int n = model->layers[layer_number].size;
+    fixed_t *input = model->layers[layer_number].activations;
+    fixed_t *output = model->layers[layer_number + 1].activations;
+    fixed_t *weights = model->layers[layer_number].weights;
+    fixed_t *biases = model->layers[layer_number].biases;
 
-    int index = max_index(model->layers[out_layer_number].activations, output_size);
+    #pragma omp parallel for schedule(dynamic) num_threads(NUM_THREADS)
+    for (int i = 0; i < d; i++) {
+        int64_t sum = (int64_t)biases[i] * FIXED_SCALE;
+        for (int j = 0; j < n; j++) {
+            sum += (int64_t)weights[i * n + j] * input[j];
+        }
+        output[i] = (fixed_t)(sum / FIXED_SCALE);
+        if (output[i] > FLOAT_TO_FIXED(100.0f)) output[i] = FLOAT_TO_FIXED(100.0f);
+        if (output[i] < FLOAT_TO_FIXED(-100.0f)) output[i] = FLOAT_TO_FIXED(-100.0f);
+    }
+}
+#elif defined(USE_PTHREADS)
+typedef struct {
+    int start_idx;
+    int end_idx;
+    int input_size;
+    fixed_t *weights;
+    fixed_t *biases;
+    fixed_t *input;
+    fixed_t *output;
+} NeuronTask;
 
+void *compute_neurons(void *arg) {
+    NeuronTask *task = (NeuronTask *)arg;
+    for (int i = task->start_idx; i < task->end_idx; i++) {
+        int64_t sum = (int64_t)task->biases[i] * FIXED_SCALE;
+        for (int j = 0; j < task->input_size; j++) {
+            sum += (int64_t)task->weights[i * task->input_size + j] * task->input[j];
+        }
+        task->output[i] = (fixed_t)(sum / FIXED_SCALE);
+        if (task->output[i] > FLOAT_TO_FIXED(100.0f)) task->output[i] = FLOAT_TO_FIXED(100.0f);
+        if (task->output[i] < FLOAT_TO_FIXED(-100.0f)) task->output[i] = FLOAT_TO_FIXED(-100.0f);
+    }
+    return NULL;
+}
+
+void forward(NN *model, int layer_number) {
+    int d = model->layers[layer_number + 1].size;
+    int n = model->layers[layer_number].size;
+    fixed_t *input = model->layers[layer_number].activations;
+    fixed_t *output = model->layers[layer_number + 1].activations;
+    fixed_t *weights = model->layers[layer_number].weights;
+    fixed_t *biases = model->layers[layer_number].biases;
+
+    int chunk_size = (d + NUM_THREADS - 1) / NUM_THREADS;
+    pthread_t threads[NUM_THREADS];
+    NeuronTask tasks[NUM_THREADS];
+    int active_threads = 0;
+    for (int t = 0; t < NUM_THREADS; t++) {
+        int start = t * chunk_size;
+        int end = (t + 1) * chunk_size < d ? (t + 1) * chunk_size : d;
+        if (start >= d) break;
+        tasks[t] = (NeuronTask){start, end, n, weights, biases, input, output};
+        if (pthread_create(&threads[t], NULL, compute_neurons, &tasks[t]) != 0) {
+            ERR("Failed to create thread %d", t);
+            exit(1);
+        }
+        active_threads++;
+    }
+    for (int t = 0; t < active_threads; t++) {
+        if (pthread_join(threads[t], NULL) != 0) {
+            ERR("Failed to join thread %d", t);
+            exit(1);
+        }
+    }
+}
+#else
+void forward(NN *model, int layer_number) {
+    int d = model->layers[layer_number + 1].size;
+    int n = model->layers[layer_number].size;
+    fixed_t *input = model->layers[layer_number].activations;
+    fixed_t *output = model->layers[layer_number + 1].activations;
+    fixed_t *weights = model->layers[layer_number].weights;
+    fixed_t *biases = model->layers[layer_number].biases;
+
+    for (int i = 0; i < d; i++) {
+        int64_t sum = (int64_t)biases[i] * FIXED_SCALE;
+        for (int j = 0; j < n; j++) {
+            sum += (int64_t)weights[i * n + j] * input[j];
+        }
+        output[i] = (fixed_t)(sum / FIXED_SCALE);
+        if (output[i] > FLOAT_TO_FIXED(100.0f)) output[i] = FLOAT_TO_FIXED(100.0f);
+        if (output[i] < FLOAT_TO_FIXED(-100.0f)) output[i] = FLOAT_TO_FIXED(-100.0f);
+    }
+}
+#endif
+
+void prep_rs(NN *rs, data *dataset, int image_number) {
+    int offset = image_number * INPUT_SIZE;
+    for (int i = 0; i < INPUT_SIZE; i++) {
+        rs->layers[0].activations[i] = FLOAT_TO_FIXED(dataset->test_images[offset + i]);
+    }
+}
+
+void test(NN *model, int correct_label) {
+    int out_layer_number = model->n + 1;
+    for (int i = 0; i < model->n; i++) {
+        forward(model, i);
+        relu(model->layers[i + 1].activations, model->layers[i + 1].size);
+    }
+    forward(model, model->n);
+    fixed_t *output = model->layers[out_layer_number].activations;
+    fixed_t temp[OUTPUT_SIZE];
+    softmax(output, OUTPUT_SIZE, temp);
+    memcpy(output, temp, OUTPUT_SIZE * sizeof(fixed_t));
+    int index = max_index(output, OUTPUT_SIZE);
     if (index == correct_label) {
         model->num_correct_predictions++;
     }
 }
-int main()
-{
+
+int main(int argc, char *argv[]) {
+#ifdef USE_MPI
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+    // Print debug information
+    print_mpi_debug_info();
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        printf("\n=== DISTRIBUTED MEMORY VERIFICATION ===\n");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    verify_distributed_memory();
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    test_memory_isolation();
+    MPI_Barrier(MPI_COMM_WORLD);
+    
+    if (rank == 0) {
+        printf("\n=== STARTING NEURAL NETWORK INFERENCE ===\n");
+    }
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+
     char *file_name = "saved_model.NN";
-    int n=1;//number of hidden layers, might be able to set up a file format where even this is read, future work ...
-    NN model_1;
-    data dataset_1;
+    NN model_1 = {0};
+    data dataset_1 = {0};
     malloc_data(&dataset_1);
-    // Read training data
-    printf("Loading test data...\n");
-    read_mnist_images("./data/t10k-images.idx3-ubyte", dataset_1.test_images, num_test_images);
-    read_mnist_labels("./data/t10k-labels.idx1-ubyte", dataset_1.test_labels, num_test_images);
-    printf("Loaded test data\n");
-    load_weights(&model_1,file_name);
-    //random_weights(&model_1);//comment this and uncomment the previous line after try_1 to make sure that load works.
-    model_1.num_correct_predictions=0;
-    for (int i = 1; i <=num_test_images; i++)
-    {
-        //need to updte rs->inp  and correct_label here
-        prep_rs(&model_1,&dataset_1,i-1);
-        //rs_1.inp=(float*)(dataset_1.training_images+i*input_size*sizeof(float));
-        test(&model_1,dataset_1.test_labels[i-1]);
-        if(i%1000==0)
-        {
-            printf("%d images processed... accuracy: %f\n",i,(float)model_1.num_correct_predictions / i);
-            fflush(stdout);
+    
+#ifdef USE_MPI
+    if (rank == 0) {
+#endif
+        LOG("Loading test data...");
+        read_mnist_images("./data/t10k-images.idx3-ubyte", dataset_1.test_images, NUM_TEST_IMAGES);
+        read_mnist_labels("./data/t10k-labels.idx1-ubyte", dataset_1.test_labels, NUM_TEST_IMAGES);
+        LOG("Loaded test data");
+#ifdef USE_MPI
+    }
+    
+    // Broadcast test data to all processes
+    MPI_Bcast(dataset_1.test_images, NUM_TEST_IMAGES * INPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(dataset_1.test_labels, NUM_TEST_IMAGES, MPI_INT, 0, MPI_COMM_WORLD);
+#endif
+    
+    load_weights(&model_1, file_name);
+
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    model_1.num_correct_predictions = 0;
+    for (int i = 0; i < NUM_TEST_IMAGES; i++) {
+        prep_rs(&model_1, &dataset_1, i);
+        test(&model_1, dataset_1.test_labels[i]);
+#ifdef USE_MPI
+        if (rank == 0 && (i + 1) % 1000 == 0) {
+#else
+        if ((i + 1) % 1000 == 0) {
+#endif
+            LOG("%d images processed... accuracy: %f", i + 1, 
+                (float)model_1.num_correct_predictions / (i + 1));
         }
     }
-    printf("Test Accuracy: %f\n",(float) model_1.num_correct_predictions / num_test_images);
-    fflush(stdout);
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    long ms = (end.tv_sec - start.tv_sec) * 1000 + (end.tv_nsec - start.tv_nsec) / 1000000;
+
+#ifdef USE_MPI
+    if (rank == 0) {
+#endif
+        float accuracy = (float)model_1.num_correct_predictions / NUM_TEST_IMAGES;
+        printf("Test Accuracy: %.4f\n", accuracy);
+        printf("Inference Time: %ld ms\n", ms);
+#ifdef USE_MPI
+    }
     
-    free_runstate(&model_1);
-    free_data(&dataset_1);
+    MPI_Finalize();
+#endif
+
+    // free_data(&dataset_1);
+    // free_memory_pool((struct MemoryPool *)model_1.layers[0].activations); // Pool allocated in load_weights
     return 0;
 }
